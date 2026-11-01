@@ -2,6 +2,7 @@ import argparse
 import requests
 import logging
 import socket
+import sys
 from urllib.parse import urlparse
 
 # Configure logging
@@ -13,7 +14,7 @@ def setup_argparse():
     """
     parser = argparse.ArgumentParser(description='vscan-server-banner-grabber: Retrieves server banners to identify software versions.')
     parser.add_argument('target', help='Target URL or IP address (e.g., http://example.com or 192.168.1.1)')
-    parser.add_argument('-p', '--port', type=int, default=80, help='Port number to connect to (default: 80)')
+    parser.add_argument('-p', '--port', type=int, default=None, help='Port number to connect to (default: 80, or the port in the target URL)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output (debug logging)')
     parser.add_argument('-t', '--timeout', type=int, default=5, help='Timeout for requests in seconds (default: 5)')
     return parser.parse_args()
@@ -22,39 +23,51 @@ def grab_banner(target, port, timeout):
     """
     Grabs the server banner from the target.
     """
+    # Decide whether the target is an IP literal first. That test is
+    # separate from whether a connection to it succeeds.
+    is_ip = False
     try:
-        # Attempt to connect using sockets if it's an IP
-        try:
-            socket.inet_aton(target)
-            # It's a valid IP address
+        socket.inet_aton(target)
+        is_ip = True
+    except (socket.error, OSError):
+        is_ip = False
+
+    try:
+        if is_ip:
+            effective_port = port if port is not None else 80
             logging.info(f"Target is an IP Address: {target}")
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(timeout)
-                s.connect((target, port))
-                s.send(b"HEAD / HTTP/1.1\r\nHost: " + target.encode() + b"\r\n\r\n")
-                banner = s.recv(1024).decode('utf-8', errors='ignore')  # Decode the banner, ignoring errors
-                return banner
-        except socket.error as e:
-            #If IP fails, try URL instead
-            logging.debug(f"Socket connection to IP failed: {e}. Trying as URL.")
-            # Try to parse the URL to make a request
-            parsed_url = urlparse(target)
-            if not parsed_url.scheme:
-                target = "http://" + target # Add default scheme if missing
-            
-            logging.info(f"Trying URL: {target}")
-            response = requests.head(target, timeout=timeout, allow_redirects=True)
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-            
-            # Extract the server header
-            if 'Server' in response.headers:
-                return response.headers['Server']
-            else:
-                logging.info("Server header not found in HTTP response.")
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(timeout)
+                    s.connect((target, effective_port))
+                    s.send(b"HEAD / HTTP/1.1\r\nHost: " + target.encode() + b"\r\n\r\n")
+                    banner = s.recv(1024).decode('utf-8', errors='ignore')
+                    return banner if banner else None
+            except (socket.error, OSError) as e:
+                logging.error(f"Connect failed for IP target {target}:{effective_port}: {e}")
                 return None
+
+        # Hostname or URL path: apply the requested port.
+        raw = target if urlparse(target).scheme else "http://" + target
+        parsed_url = urlparse(raw)
+        effective_port = port if port is not None else (parsed_url.port or 80)
+        host = parsed_url.hostname or ""
+        netloc = f"{host}:{effective_port}"
+        if parsed_url.username:
+            netloc = parsed_url.username + (":" + parsed_url.password if parsed_url.password else "") + "@" + netloc
+        url_with_port = parsed_url._replace(netloc=netloc).geturl()
+        logging.info(f"Trying URL: {url_with_port}")
+        try:
+            response = requests.head(url_with_port, timeout=timeout, allow_redirects=True)
         except requests.exceptions.RequestException as e:
             logging.error(f"Request failed: {e}")
             return None
+        # Error responses are responses: read the banner before any status check.
+        logging.info(f"Response status: {response.status_code}")
+        if 'Server' in response.headers:
+            return response.headers['Server']
+        logging.info("Server header not found in HTTP response.")
+        return None
 
 
 
@@ -83,7 +96,8 @@ def main():
         logging.info(f"Server Banner: {banner}")
     else:
         print("Failed to retrieve server banner.")
-        logging.info("Failed to retrieve server banner.")
+        logging.error("Failed to retrieve server banner.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
