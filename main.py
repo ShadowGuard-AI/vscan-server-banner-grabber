@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import requests
 import logging
 import socket
@@ -19,18 +20,28 @@ def setup_argparse():
     parser.add_argument('-t', '--timeout', type=int, default=5, help='Timeout for requests in seconds (default: 5)')
     return parser.parse_args()
 
+def _server_header_from_head(head):
+    """Return the Server header value from a raw HTTP response head, or None."""
+    for line in head.splitlines():
+        if line.lower().startswith("server:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
 def grab_banner(target, port, timeout):
     """
-    Grabs the server banner from the target.
+    Grabs the Server banner from the target. Both the IP literal path and
+    the hostname or URL path return the same thing: the value of the
+    Server header, or None when no banner could be retrieved. The log
+    separates the reasons: connection failure, request failure, and a
+    reachable server that sent no Server header.
     """
-    # Decide whether the target is an IP literal first. That test is
-    # separate from whether a connection to it succeeds.
+    # Strict IPv4 literal test. Shortened forms such as 127.1 are not
+    # accepted as IP literals; they take the hostname or URL path below.
     is_ip = False
     try:
-        # inet_aton decides the whole shape of this tool and it is a loose judge. It accepts shortened numeric forms like 127.1 as an address, so a target can be treated as an IP that a person would read as a name, and then it gets the raw socket treatment below instead of the HTTP one.
-        socket.inet_aton(target)
+        ipaddress.IPv4Address(target)
         is_ip = True
-    except (socket.error, OSError):
+    except ValueError:
         is_ip = False
 
     try:
@@ -42,34 +53,52 @@ def grab_banner(target, port, timeout):
                     s.settimeout(timeout)
                     s.connect((target, effective_port))
                     s.send(b"HEAD / HTTP/1.1\r\nHost: " + target.encode() + b"\r\n\r\n")
-                    # One read of up to 1024 bytes is the whole grab on this path. A banner that arrives in two packets, or a slow greeting protocol that sends nothing until it is spoken to, comes back empty or cut, and the decode drops any byte that is not clean UTF-8.
-                    banner = s.recv(1024).decode('utf-8', errors='ignore')
-                    # The two paths in this function do not return the same kind of thing. An IP target returns the whole response head, status line and every header, while a named target below returns only the Server value, and main prints both under the same Server Banner label.
-                    return banner if banner else None
+                    # Read until the end of the response head, EOF, or an
+                    # 8192 byte cap, so a banner split across packets is
+                    # reassembled instead of cut at the first packet.
+                    chunks = []
+                    total = 0
+                    while total < 8192:
+                        chunk = s.recv(4096)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if b"\r\n\r\n" in b"".join(chunks):
+                            break
+                    head = b"".join(chunks).decode('utf-8', errors='ignore')
             except (socket.error, OSError) as e:
                 logging.error(f"Connect failed for IP target {target}:{effective_port}: {e}")
                 return None
+            banner = _server_header_from_head(head)
+            if banner:
+                return banner
+            logging.info("Server header not found in raw response from IP target.")
+            return None
 
         # Hostname or URL path: apply the requested port.
         raw = target if urlparse(target).scheme else "http://" + target
         parsed_url = urlparse(raw)
-        effective_port = port if port is not None else (parsed_url.port or 80)
+        if parsed_url.scheme not in ("http", "https"):
+            logging.error(f"Invalid target scheme: {parsed_url.scheme} (only http and https are supported)")
+            return None
+        effective_port = port if port is not None else (parsed_url.port or (443 if parsed_url.scheme == "https" else 80))
         host = parsed_url.hostname or ""
-        # Rebuilding the netloc puts the port in even when the caller never wrote one, and the line above it carries any userinfo from the original URL into the rebuilt one, password included. The log line below then prints that rebuilt address, credentials and all, so I would not share a verbose log from a run against an authenticated address.
-        netloc = f"{host}:{effective_port}"
-        if parsed_url.username:
-            netloc = parsed_url.username + (":" + parsed_url.password if parsed_url.password else "") + "@" + netloc
+        # The rebuilt netloc never carries userinfo, so a password in the
+        # original target is neither sent nor printed in the log line.
+        netloc = f"[{host}]:{effective_port}" if ":" in host else f"{host}:{effective_port}"
         url_with_port = parsed_url._replace(netloc=netloc).geturl()
         logging.info(f"Trying URL: {url_with_port}")
         try:
-            # Following redirects on a HEAD means the banner belongs to wherever the chain lands. A front end that redirects to a different stack reports that stacks Server header under the original targets name.
-            response = requests.head(url_with_port, timeout=timeout, allow_redirects=True)
+            # Redirects are not followed: the banner reported is the one
+            # the requested target itself returned, not the banner of
+            # wherever a redirect chain would have landed.
+            response = requests.head(url_with_port, timeout=timeout, allow_redirects=False)
         except requests.exceptions.RequestException as e:
             logging.error(f"Request failed: {e}")
             return None
         # Error responses are responses: read the banner before any status check.
         logging.info(f"Response status: {response.status_code}")
-        # A server that sends no Server header and a server that cannot be reached both end as None here or above, and main prints the same failure line for both. Nothing in the output separates a quiet server from a dead one.
         if 'Server' in response.headers:
             return response.headers['Server']
         logging.info("Server header not found in HTTP response.")
@@ -93,7 +122,19 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)  # Set logging level to DEBUG if verbose is enabled
 
-    logging.info(f"Starting banner grabbing for {args.target}:{args.port}")
+    if args.port is not None and not (1 <= args.port <= 65535):
+        logging.error("Port must be between 1 and 65535.")
+        sys.exit(2)
+
+    if args.timeout <= 0:
+        logging.error("Timeout must be positive.")
+        sys.exit(2)
+
+    # Log a userinfo-free form of the target, so a password embedded in a
+    # URL target never lands in a log.
+    _parsed = urlparse(args.target if urlparse(args.target).scheme else "http://" + args.target)
+    _display = _parsed._replace(netloc=_parsed.netloc.rsplit("@", 1)[-1]).geturl() if "@" in _parsed.netloc else args.target
+    logging.info(f"Starting banner grabbing for {_display} (port: {args.port if args.port is not None else 'default'})")
 
     banner = grab_banner(args.target, args.port, args.timeout)
 
@@ -119,10 +160,10 @@ Usage Examples:
     python main.py example.com -p 8080
 
 3.  Enable verbose output for debugging:
-    python main.py http://example.com -v
+    python main.py example.com -v
 
 4.  Set a custom timeout value:
-    python main.py http://example.com -t 10
+    python main.py example.com -t 10
 
 5. Target IP address:
     python main.py 127.0.0.1
